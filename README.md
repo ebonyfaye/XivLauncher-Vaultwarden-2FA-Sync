@@ -79,7 +79,7 @@ You can install the Bitwarden CLI automatically using **winget** (recommended) o
    $session = bw unlock --raw
    if ($session) {
        [System.IO.File]::WriteAllText("C:\XIVLauncherBatch\bw_session.txt", $session)
-   }
+   }```
 
 
 ---
