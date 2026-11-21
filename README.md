@@ -105,6 +105,12 @@ set OTP_LOCK=%LOCAL_ROAMING_ROOT%\otp.lock
 set VW_ITEM_MAP=%LOCAL_ROAMING_ROOT%\vw_items.txt
 set VW_SESSION_FILE=%LOCAL_ROAMING_ROOT%\bw_session.txt
 
+rem --- Clear any inherited character variables before loading env ------------
+set "ROAMINGPATH="
+set "ROAMINGPATH_PRE="
+set "XIVLAUNCHER_ACCOUNT="
+set "XIVLAUNCHER_USE_OTP="
+set "XIVLAUNCHER_USE_STEAM="
 
 rem ***************************************************************************
 rem * P R O C E S S I N G                                                     *
@@ -120,15 +126,16 @@ rem --- Check character virtualization ----------------------------------------
 call "%~dp0%\XIVLauncher-env.cmd"
 
 if not "%ROAMINGPATH_PRE%" == "" (
-  set ROAMINGPATH=%ROAMINGPATH_PRE%
+  set "ROAMINGPATH=%ROAMINGPATH_PRE%"
 )
 
-rem --- Sync ONLY this character's folder from NAS (X:) to Local C: -----------
+if "%ROAMINGPATH:~-1%"=="\" set "ROAMINGPATH=%ROAMINGPATH:~0,-1%"
 for %%I in ("%ROAMINGPATH%") do set "CHAR_FOLDER=%%~nxI"
+
+echo Detected character folder: [%CHAR_FOLDER%] from [%ROAMINGPATH%]
+
 set "NAS_CHAR_PATH=%ROAMINGPATH%"
 set "LOCAL_CHAR_PATH=%LOCAL_ROAMING_ROOT%\%CHAR_FOLDER%"
-
-if "%LOCAL_CHAR_PATH:~-1%"=="\" set "LOCAL_CHAR_PATH=%LOCAL_CHAR_PATH:~0,-1%"
 
 echo Syncing %CHAR_FOLDER% from %NAS_CHAR_PATH% to %LOCAL_CHAR_PATH%...
 robocopy "%NAS_CHAR_PATH%" "%LOCAL_CHAR_PATH%" /MIR /XO /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS
@@ -142,6 +149,21 @@ if not "%XIVLAUNCHER_ACCOUNT%" == "" (
   set XIVLAUNCHER_ACCOUNT_ARG=--account="%XIVLAUNCHER_ACCOUNT%-%XIVLAUNCHER_USE_OTP%-%XIVLAUNCHER_USE_STEAM%"
   echo.
   echo Setting XIVLauncher account name to: %XIVLAUNCHER_ACCOUNT% [Use OTP: %XIVLAUNCHER_USE_OTP%, Is Steam: %XIVLAUNCHER_USE_STEAM%]
+)
+
+rem --- Check if this character has a mapped 2FA entry in vw_items.txt --------
+set "VW_ITEM_ID="
+if exist "%VW_ITEM_MAP%" (
+  for /f "usebackq tokens=1,2 delims==" %%A in ("%VW_ITEM_MAP%") do (
+    if /i "%%A"=="%CHAR_FOLDER%" set "VW_ITEM_ID=%%B"
+  )
+)
+
+rem --- Skip OTP lock and port 4646 wait if no 2FA mapping exists -------------
+if "%VW_ITEM_ID%"=="" (
+  echo No 2FA mapping for %CHAR_FOLDER% in vw_items.txt. Launching XIVLauncher directly...
+  start "XIV Launcher" "%XIVLAUNCHER_LOCALDATA%\current\XIVLauncher.exe" --roamingPath="%ROAMINGPATH%" %XIVLAUNCHER_ACCOUNT_ARG% %*
+  goto :POST_LAUNCH
 )
 
 rem --- Clear stale lock immediately if no XIVLauncher.exe is currently open --
@@ -186,19 +208,6 @@ if "%BW_KEY%"=="" (
   goto :RELEASE_LOCK
 )
 
-rem --- Look up pre-mapped item UUID for %CHAR_FOLDER% ------------------------
-set "VW_ITEM_ID="
-if exist "%VW_ITEM_MAP%" (
-  for /f "usebackq tokens=1,2 delims==" %%A in ("%VW_ITEM_MAP%") do (
-    if /i "%%A"=="%CHAR_FOLDER%" set "VW_ITEM_ID=%%B"
-  )
-)
-
-if "%VW_ITEM_ID%"=="" (
-  echo No Vaultwarden item ID mapped for %CHAR_FOLDER% in %VW_ITEM_MAP%.
-  goto :RELEASE_LOCK
-)
-
 rem --- Fetch live 6-digit TOTP using --session and --nointeraction -----------
 echo Fetching live OTP for %CHAR_FOLDER%...
 set "LIVE_OTP="
@@ -207,7 +216,7 @@ for /f "delims=" %%T in ('bw get totp "%VW_ITEM_ID%" --session "%BW_KEY%" --noin
 echo %LIVE_OTP%| findstr /r "^[0-9][0-9][0-9][0-9][0-9][0-9]$" >nul
 if "%ERRORLEVEL%"=="0" (
   echo Sending fresh OTP %LIVE_OTP% to XIVLauncher...
-  curl.exe -4 -s --http0.9 --max-time 3 "[http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP](http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP)%" >nul 2>&1
+  curl.exe -4 -s --http0.9 --max-time 3 "http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP%" >nul 2>&1
   echo Sent OTP to XIVLauncher.
   timeout /t 2 /nobreak >nul
 ) else (
@@ -217,8 +226,9 @@ if "%ERRORLEVEL%"=="0" (
 :RELEASE_LOCK
 if exist "%OTP_LOCK%" del /f /q "%OTP_LOCK%" >nul 2>&1
 
-rem --- Give XIVLauncher time to spawn game before checking process exit ------
-timeout /t 10 /nobreak >nul
+:POST_LAUNCH
+rem --- Give XIVLauncher 20s to spawn ffxiv_dx11.exe before checking exit -----
+timeout /t 20 /nobreak >nul
 
 :WAIT_FOR_PROCESSES
 timeout /t 5 /nobreak >nul
