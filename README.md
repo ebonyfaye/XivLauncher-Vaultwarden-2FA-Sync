@@ -1,264 +1,188 @@
-# Automated FFXIV Multi-Client 2FA/TOTP Login (ISBoxer + XIVLauncher + Vaultwarden)
+# XIVLauncher Multi-Client Vaultwarden 2FA Wrapper
 
-Automated One-Time Password (TOTP) injection for multi-boxing **Final Fantasy XIV** using **Inner Space / ISBoxer**, **XIVLauncher**, and a self-hosted **Vaultwarden** instance via the Bitwarden CLI (`bw`). Supports mixed teams of 2FA and non-2FA accounts seamlessly.
+Automated One-Time Password (TOTP) injection and profile synchronization wrapper for running multiple **Final Fantasy XIV** clients simultaneously via **XIVLauncher** and **ISBoxer**, backed by a self-hosted **Vaultwarden** (or official **Bitwarden**) vault.
 
----
-
-## Overview & Architecture
-
-When launching multiple FFXIV accounts simultaneously via ISBoxer, XIVLauncher exposes a local HTTP listener on `127.0.0.1:4646` to receive TOTP codes. This wrapper batch script (`XIVLauncher.cmd`) coordinates multi-client launches without port collisions, interactive CLI prompts, or delays on non-2FA accounts:
-
-1. **Clean Environment & NAS-to-Local Sync:** Clears any inherited character variables, loads `XIVLauncher-env.cmd`, and mirrors the character's roaming profile from the network share (`X:\XIVLauncherBatch\<character>`) to local storage (`C:\XIVLauncherBatch\<character>`) using multi-threaded `robocopy` (`/MT:8`), syncing changes back after the game closes.
-2. **Automatic Non-2FA Pass-Through:** Checks `C:\XIVLauncherBatch\vw_items.txt` for a character-to-UUID mapping. Characters omitted from `vw_items.txt` bypass the OTP queue and port `4646` wait completely, launching directly into the game.
-3. **Stale Lock Recovery & Queue Serialization:** Uses `C:\XIVLauncherBatch\otp.lock` to serialize 2FA launches one character at a time so simultaneous ISBoxer clients never collide on port `4646`. Automatically clears stale lock files if no `XIVLauncher.exe` process is running or if a lock exceeds 65 seconds.
-4. **Listener Detection & Window Guard:** Polls `127.0.0.1:4646` via .NET `TcpClient` (up to 60 seconds) and checks remaining seconds in the current 30-second TOTP window (waiting if fewer than 7 seconds remain so codes never expire mid-submission).
-5. **Non-Interactive Vaultwarden Lookup:** Reads the pre-mapped item UUID (`vw_items.txt`) and a persisted CLI session key (`bw_session.txt`) to fetch the live 6-digit TOTP with `--nointeraction`, then injects it via `curl.exe -4 --http0.9`.
+> Built upon the original ISBoxer + XIVLauncher batch architecture ("Batch Voodoo") created by **[tsukasa](https://github.com/tsukasa)** ([`isboxer_ffxiv_batch`](https://github.com/tsukasa/isboxer_ffxiv_batch) / [`isboxer_ffxiv_guide`](https://github.com/tsukasa/isboxer_ffxiv_guide)).
 
 ---
 
-## Prerequisites
+## Features
 
-- **Windows 10/11** with PowerShell and built-in `curl.exe`
-- **Inner Space / ISBoxer** configured with character virtualization (`XIVLauncher-env.cmd`)
-- **XIVLauncher** installed in `%LOCALAPPDATA%\XIVLauncher`
-- **Bitwarden CLI (`bw`)** installed and configured against your Vaultwarden server (`bw config server https://your-vaultwarden-domain`)
-- **Vaultwarden Folder Structure:**
-  - Create a dedicated folder in Vaultwarden (e.g., `Final Fantasy XIV`).
-  - Name each login item identically to its corresponding character roaming folder name (e.g., `blossom`), with the TOTP authenticator seed saved on the item.
-  - Omit non-2FA characters from `vw_items.txt` so they launch directly.
+- **Automated Multi-Client 2FA (Port `4646`):** Queries your unlocked Vaultwarden/Bitwarden vault via the Bitwarden CLI (`bw get totp`) and injects the 6-digit TOTP code directly into XIVLauncher's local HTTP listener.
+- **Queue Serialization (`otp.lock`):** Prevents port `4646` collisions when launching multiple FFXIV clients at the same time in ISBoxer by queuing 2FA handshakes sequentially.
+- **Mixed-Team Support (2FA + Non-2FA Accounts):** Characters with a Vaultwarden TOTP mapping auto-fill 2FA; characters without a mapping automatically skip the OTP check and launch normally.
+- **Optional NAS Profile Sync (`ENABLE_NAS_SYNC`):** Toggleable `robocopy` mirror sync between a central network share (e.g., `X:\XIVLauncherBatch`) and a local staging folder (`C:\XIVLauncherBatch`) so Dalamud UI, plugins, and character configs stay synchronized across machines or profiles.
+- **Clean Console Feedback:** Displays clear progress messages during vault lookup, OTP transmission, and acceptance without ever printing raw TOTP codes to the terminal.
 
 ---
 
-## Directory Layout
+## Repository Structure
 
 ```text
-X:\XIVLauncherBatch\                  # Network share (source of truth)
-├── XIVLauncher.cmd                   # Main ISBoxer launch & OTP automation script
-├── XIVLauncher-env.cmd               # Per-character environment variables (ROAMINGPATH_PRE, etc.)
-└── <character>\                      # Character-specific XIVLauncher config folders
-
-C:\XIVLauncherBatch\                  # Local fast-storage working directory
-├── bw_session.txt                    # Active Bitwarden CLI session token (DO NOT COMMIT)
-├── vw_items.txt                      # 2FA Character-to-Vaultwarden Item UUID mapping
-├── otp.lock                          # Temporary runtime mutex lock (auto-cleaned)
-└── <character>\                      # Local synced roaming profile
-```
-
-> **Security Note:** Add `bw_session.txt`, `vw_items.txt`, and `otp.lock` to your `.gitignore` so sensitive session tokens and vault identifiers are never pushed to GitHub.
-
----
-
-## One-Time Setup
-
-### 1. Configure XIVLauncher Profiles
-For each **2FA-enabled** character profile:
-1. Check **Use one-time password** on the XIVLauncher login screen.
-2. Uncheck **Auto-login** (XIVLauncher must pause on the login screen to keep port `4646` open).
-3. Open **Settings (Gear Icon) → General**, enable **Enable XL Authenticator app/OTP macro support**, and click **Save**.
-4. Ensure `FFXIV.cfg` uses **Borderless Windowed** mode (`ScreenMode 1`) so Inner Space / ISBoxer hooks the DirectX 11 window cleanly without rendering a black screen.
-
-*(For **non-2FA** characters, leave **Auto-login** enabled if desired and omit them from `vw_items.txt`.)*
-
-### 2. Unlock Vaultwarden CLI & Export Item UUIDs
-Run the following in **Administrator PowerShell** to generate your local session key and map your `Final Fantasy XIV` folder items:
-
-```powershell
-# 1. Unlock Vaultwarden CLI and store the 88-character session token locally
-bw unlock --raw | Out-File -FilePath "C:\XIVLauncherBatch\bw_session.txt" -Encoding ASCII -NoNewline
-
-# 2. Retrieve your "Final Fantasy XIV" folder UUID
-$key = Get-Content "C:\XIVLauncherBatch\bw_session.txt" -Raw
-bw sync --session $key
-bw list folders --session $key
-
-# 3. Map all 2FA items in that folder to C:\XIVLauncherBatch\vw_items.txt
-$folderId = "YOUR_FFXIV_FOLDER_UUID"
-(bw list items --folderid $folderId --session $key | ConvertFrom-Json) |
-  ForEach-Object { "$($_.name)=$($_.id)" } |
-  Set-Content "C:\XIVLauncherBatch\vw_items.txt" -Encoding ASCII
-```
-
-Verify `C:\XIVLauncherBatch\vw_items.txt` contains only your 2FA-enabled characters (`character=uuid`):
-```text
-blossom=00000000-0000-0000-0000-000000000000
+├── XIVLauncher.cmd              # Main launcher wrapper (handles NAS sync, otp.lock, and 2FA injection)
+├── Update-VaultwardenMap.bat    # Syncs Vaultwarden vault and builds vw_items.txt + bw_session.txt
+├── .gitignore                   # Prevents accidental commits of bw_session.txt and vw_items.txt
+└── README.md
 ```
 
 ---
 
-## `XIVLauncher.cmd`
+## Step 1: Install Required Tools (PowerShell & Bitwarden CLI)
 
-Place this script at `X:\XIVLauncherBatch\XIVLauncher.cmd`:
+### 1. Verify / Install PowerShell
+Windows 10 and Windows 11 include **Windows PowerShell 5.1** out of the box, which works with these scripts. Optionally, you can install modern **PowerShell 7+** via `winget`:
+
+1. Open **Command Prompt** (`cmd.exe`) or **Windows Terminal**.
+2. Check if PowerShell is available:
+   ```cmd
+   powershell -Command "$PSVersionTable.PSVersion"
+   ```
+3. *(Optional)* Install the latest PowerShell 7:
+   ```cmd
+   winget install --id Microsoft.PowerShell --source winget
+   ```
+
+### 2. Install Bitwarden CLI (`bw.exe`)
+You can install the Bitwarden CLI automatically using **winget** (recommended) or manually via ZIP download.
+
+#### Option A: Install via `winget` (Recommended)
+1. Open **Command Prompt** or **PowerShell** and run:
+   ```cmd
+   winget install --id Bitwarden.CLI --source winget
+   ```
+2. **Close and reopen** your terminal window so Windows refreshes your `PATH`.
+3. Verify the installation:
+   ```cmd
+   bw --version
+   ```
+
+#### Option B: Manual Download
+1. Download the Windows ZIP (`bw-windows-xxxx.zip`) from the [Bitwarden CLI Releases](https://github.com/bitwarden/clients/releases) page.
+2. Extract `bw.exe` into a permanent folder (for example, `C:\Tools\BitwardenCLI\` or directly inside your `C:\XIVLauncherBatch\` folder).
+3. Add that folder to your Windows **System Environment Variables -> Path** (or place `bw.exe` in the same directory as `XIVLauncher.cmd` and `Update-VaultwardenMap.bat`).
+
+### 3. Connect Bitwarden CLI to Vaultwarden (or Official Bitwarden)
+1. If you use a **self-hosted Vaultwarden** server, set your server URL first *(skip this line if you use official `bitwarden.com`)*:
+   ```cmd
+   bw config server https://vault.yourdomain.com
+   ```
+2. Log in to your vault once in the terminal:
+   ```cmd
+   bw login
+   ```
+   *(Enter your email address, master password, and 2FA code if prompted.)*
+
+---
+
+## Step 2: Configure Your Vaultwarden Folder & 2FA Keys
+
+1. Log in to your **Vaultwarden** (or Bitwarden) web vault.
+2. Create a folder named **`FFIV`** (exact spelling, or update the folder name in `Update-VaultwardenMap.bat`).
+3. Inside the `FFIV` folder, create a **Login** item for each FFXIV account/character that uses 2FA:
+   - **Name:** Must match the character folder name passed to the wrapper (e.g., `blossom`, `bubbles`).
+   - **Username / Password:** Your Square Enix ID and password.
+   - **Authenticator Key (TOTP):** Paste the setup key provided by Square Enix Account Management when enabling Software Authenticator 2FA.
+
+---
+
+## Step 3: Configure the Scripts
+
+### 1. Edit `XIVLauncher.cmd`
+Open `XIVLauncher.cmd` in a text editor and verify the paths and toggle at the top:
 
 ```bat
-@echo off
-rem ***************************************************************************
-rem *                                                                         *
-rem * XIVLauncher Helper Batch File for Inner Space/ISBoxer                   *
-rem *                                                                         *
-rem ***************************************************************************
+set "XIVLAUNCHER_LOCALDATA=%LOCALAPPDATA%\XIVLauncher"
+set "ROAMINGPATH_ROOT=X:\XIVLauncherBatch"
+set "LOCAL_ROAMING_ROOT=C:\XIVLauncherBatch"
+set "ENABLE_NAS_SYNC=true"
+```
 
-rem ***************************************************************************
-rem * C O N F I G U R A T I O N                                               *
-rem ***************************************************************************
+- **`ENABLE_NAS_SYNC=true`**: Mirrors character profiles from your network share (`X:\XIVLauncherBatch`) to local disk (`C:\XIVLauncherBatch`) before launch, and syncs updated Dalamud/UI configs back on exit.
+- **`ENABLE_NAS_SYNC=false`**: Runs purely from local storage without requiring a network drive.
 
-set XIVLAUNCHER_LOCALDATA=%LOCALAPPDATA%\XIVLauncher
-set ROAMINGPATH_ROOT=X:\XIVLauncherBatch
-set LOCAL_ROAMING_ROOT=C:\XIVLauncherBatch
-set OTP_LOCK=%LOCAL_ROAMING_ROOT%\otp.lock
-set VW_ITEM_MAP=%LOCAL_ROAMING_ROOT%\vw_items.txt
-set VW_SESSION_FILE=%LOCAL_ROAMING_ROOT%\bw_session.txt
+### 2. Generate `vw_items.txt` and `bw_session.txt`
+1. Run **`Update-VaultwardenMap.bat`** and enter your Vaultwarden master password when prompted.
+2. The script will unlock your vault, sync the latest items, filter your `FFIV` folder, and generate two files in your root batch directory:
+   - `bw_session.txt` (your active CLI session token)
+   - `vw_items.txt` (maps character names to Vaultwarden item IDs):
+     ```text
+     blossom=11111111-2222-3333-4444-555555555555
+     bubbles=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+     ```
+3. Re-run **`Update-VaultwardenMap.bat`** whenever you add a new character or rotate a 2FA secret.
 
-rem --- Clear any inherited character variables before loading env ------------
-set "ROAMINGPATH="
-set "ROAMINGPATH_PRE="
-set "XIVLAUNCHER_ACCOUNT="
-set "XIVLAUNCHER_USE_OTP="
-set "XIVLAUNCHER_USE_STEAM="
+> **Security Warning:** Never upload `bw_session.txt` or `vw_items.txt` to GitHub. Keep both listed in `.gitignore`.
 
-rem ***************************************************************************
-rem * P R O C E S S I N G                                                     *
-rem ***************************************************************************
+---
 
-if not exist "%XIVLAUNCHER_LOCALDATA%" (
-  echo Error: XIVLauncher not found in "%XIVLAUNCHER_LOCALDATA%".
-  pause
-  goto :END_OF_FILE
-)
+## Step 4: Configure XIVLauncher & ISBoxer
 
-rem --- Check character virtualization ----------------------------------------
-call "%~dp0%\XIVLauncher-env.cmd"
+### 1. XIVLauncher Settings (Per Character)
+1. Launch XIVLauncher once per character profile to log in and save your Square Enix password.
+2. On the XIVLauncher login screen:
+   - Check **Use One-Time Password** (for accounts with 2FA enabled).
+   - Check **Log in automatically** (optional, once password is saved).
+3. In XIVLauncher **Settings -> Auto-Login / Web Services**:
+   - Ensure **Enable XL Web Services** is enabled (listens locally on `http://localhost:4646/ffxivlauncher/<OTP>`).
 
-if not "%ROAMINGPATH_PRE%" == "" (
-  set "ROAMINGPATH=%ROAMINGPATH_PRE%"
-)
+### 2. ISBoxer Virtual Files (`XIVLauncher-env.cmd`)
+Following [tsukasa's ISBoxer FFXIV Guide](https://github.com/tsukasa/isboxer_ffxiv_guide):
+1. Point your Inner Space FFXIV game profile executable to **`XIVLauncher.cmd`**.
+2. Assign a per-character **`XIVLauncher-env.cmd`** virtual file in ISBoxer so each character sets its own profile folder name before `XIVLauncher.cmd` runs.
 
-if "%ROAMINGPATH:~-1%"=="\" set "ROAMINGPATH=%ROAMINGPATH:~0,-1%"
-for %%I in ("%ROAMINGPATH%") do set "CHAR_FOLDER=%%~nxI"
+---
 
-echo Detected character folder: [%CHAR_FOLDER%] from [%ROAMINGPATH%]
+## How It Works
 
-set "NAS_CHAR_PATH=%ROAMINGPATH%"
-set "LOCAL_CHAR_PATH=%LOCAL_ROAMING_ROOT%\%CHAR_FOLDER%"
-
-echo Syncing %CHAR_FOLDER% from %NAS_CHAR_PATH% to %LOCAL_CHAR_PATH%...
-robocopy "%NAS_CHAR_PATH%" "%LOCAL_CHAR_PATH%" /MIR /XO /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS
-
-set "ROAMINGPATH=%LOCAL_CHAR_PATH%"
-title XIV Sync - %CHAR_FOLDER%
-echo Will be using local directory as roamingPath: %ROAMINGPATH%
-
-rem --- Set-up --account parameter --------------------------------------------
-if not "%XIVLAUNCHER_ACCOUNT%" == "" (
-  set XIVLAUNCHER_ACCOUNT_ARG=--account="%XIVLAUNCHER_ACCOUNT%-%XIVLAUNCHER_USE_OTP%-%XIVLAUNCHER_USE_STEAM%"
-  echo.
-  echo Setting XIVLauncher account name to: %XIVLAUNCHER_ACCOUNT% [Use OTP: %XIVLAUNCHER_USE_OTP%, Is Steam: %XIVLAUNCHER_USE_STEAM%]
-)
-
-rem --- Check if this character has a mapped 2FA entry in vw_items.txt --------
-set "VW_ITEM_ID="
-if exist "%VW_ITEM_MAP%" (
-  for /f "usebackq tokens=1,2 delims==" %%A in ("%VW_ITEM_MAP%") do (
-    if /i "%%A"=="%CHAR_FOLDER%" set "VW_ITEM_ID=%%B"
-  )
-)
-
-rem --- Skip OTP lock and port 4646 wait if no 2FA mapping exists -------------
-if "%VW_ITEM_ID%"=="" (
-  echo No 2FA mapping for %CHAR_FOLDER% in vw_items.txt. Launching XIVLauncher directly...
-  start "XIV Launcher" "%XIVLAUNCHER_LOCALDATA%\current\XIVLauncher.exe" --roamingPath="%ROAMINGPATH%" %XIVLAUNCHER_ACCOUNT_ARG% %*
-  goto :POST_LAUNCH
-)
-
-rem --- Clear stale lock immediately if no XIVLauncher.exe is currently open --
-tasklist /FI "IMAGENAME eq XIVLauncher.exe" 2>NUL | find /I /N "XIVLauncher.exe">NUL
-if not "%ERRORLEVEL%"=="0" (
-  if exist "%OTP_LOCK%" del /f /q "%OTP_LOCK%" >nul 2>&1
-)
-
-rem --- Acquire brief OTP queue lock (auto-clears locks older than 65s) -------
-powershell -NoProfile -Command "if (Test-Path $env:OTP_LOCK) { if (((Get-Date) - (Get-Item $env:OTP_LOCK).LastWriteTime).TotalSeconds -gt 65) { Remove-Item $env:OTP_LOCK -Force } }"
-:WAIT_FOR_LOCK
-if exist "%OTP_LOCK%" (
-  timeout /t 1 /nobreak >nul
-  goto :WAIT_FOR_LOCK
-)
-echo %CHAR_FOLDER% > "%OTP_LOCK%"
-
-rem --- Start XIVLauncher -----------------------------------------------------
-echo Launching XIVLauncher...
-start "XIV Launcher" "%XIVLAUNCHER_LOCALDATA%\current\XIVLauncher.exe" --roamingPath="%ROAMINGPATH%" %XIVLAUNCHER_ACCOUNT_ARG% %*
-
-rem --- Wait up to 60s for port 4646 listener ---------------------------------
-echo Waiting for XIVLauncher OTP listener on port 4646...
-powershell -NoProfile -Command "$deadline = (Get-Date).AddSeconds(60); while ((Get-Date) -lt $deadline) { $c = New-Object Net.Sockets.TcpClient; try { $c.Connect('127.0.0.1', 4646); $c.Close(); exit 0 } catch { Start-Sleep -Milliseconds 300 } }; exit 1"
-if not "%ERRORLEVEL%"=="0" (
-  echo Timed out waiting for XIVLauncher port 4646 after 60s.
-  goto :RELEASE_LOCK
-)
-echo Port 4646 detected!
-
-rem --- Ensure at least 7 seconds remain in the 30s TOTP window ---------------
-powershell -NoProfile -Command "$rem = 30 - ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() %% 30); if ($rem -lt 7) { Write-Host \"Code expiring in ${rem}s, waiting for fresh code...\"; Start-Sleep -Seconds ($rem + 1) }"
-
-rem --- Read saved Vaultwarden session key ------------------------------------
-set "BW_KEY="
-if exist "%VW_SESSION_FILE%" (
-  set /p BW_KEY=<"%VW_SESSION_FILE%"
-)
-
-if "%BW_KEY%"=="" (
-  echo Missing Vaultwarden session key in %VW_SESSION_FILE%.
-  goto :RELEASE_LOCK
-)
-
-rem --- Fetch live 6-digit TOTP using --session and --nointeraction -----------
-echo Fetching live OTP for %CHAR_FOLDER%...
-set "LIVE_OTP="
-for /f "delims=" %%T in ('bw get totp "%VW_ITEM_ID%" --session "%BW_KEY%" --nointeraction 2^>^&1') do set "LIVE_OTP=%%T"
-
-echo %LIVE_OTP%| findstr /r "^[0-9][0-9][0-9][0-9][0-9][0-9]$" >nul
-if "%ERRORLEVEL%"=="0" (
-  echo Sending fresh OTP %LIVE_OTP% to XIVLauncher...
-  curl.exe -4 -s --http0.9 --max-time 3 "[http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP](http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP)%" >nul 2>&1
-  echo Sent OTP to XIVLauncher.
-  timeout /t 2 /nobreak >nul
-) else (
-  echo Vaultwarden TOTP error for %CHAR_FOLDER%: %LIVE_OTP%
-)
-
-:RELEASE_LOCK
-if exist "%OTP_LOCK%" del /f /q "%OTP_LOCK%" >nul 2>&1
-
-:POST_LAUNCH
-rem --- Give XIVLauncher 20s to spawn ffxiv_dx11.exe before checking exit -----
-timeout /t 20 /nobreak >nul
-
-:WAIT_FOR_PROCESSES
-timeout /t 5 /nobreak >nul
-tasklist /FI "IMAGENAME eq XIVLauncher.exe" 2>NUL | find /I /N "XIVLauncher.exe">NUL
-if "%ERRORLEVEL%"=="0" goto :WAIT_FOR_PROCESSES
-tasklist /FI "IMAGENAME eq ffxiv_dx11.exe" 2>NUL | find /I /N "ffxiv_dx11.exe">NUL
-if "%ERRORLEVEL%"=="0" goto :WAIT_FOR_PROCESSES
-
-rem --- Sync updated character data back to NAS (X:) --------------------------
-echo.
-echo Game closed. Syncing %CHAR_FOLDER% back to %NAS_CHAR_PATH%...
-robocopy "%LOCAL_CHAR_PATH%" "%NAS_CHAR_PATH%" /MIR /XO /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS
-echo Sync complete!
-pause
-
-exit 0
-:END_OF_FILE
+```text
+[ISBoxer / Launcher]
+        │
+        ▼
+[1. NAS Sync (Optional)] ──► robocopy X:\XIVLauncherBatch\<char> -> C:\XIVLauncherBatch\<char>
+        │
+        ▼
+[2. Lookup vw_items.txt]
+        ├── No mapping found ──► Prints skip notice & launches XIVLauncher directly
+        │
+        └── Mapping found ─────► Acquires otp.lock (queues parallel launches)
+                                   │
+                                   ▼
+                                 Launches XIVLauncher.exe (listens on port 4646)
+                                   │
+                                   ▼
+                                 Runs `bw get totp <item_id> --nointeraction`
+                                   │
+                                   ▼
+                                 Sends HTTP GET to localhost:4646/ffxivlauncher/<OTP>
+                                   │
+                                   ▼
+                                 Releases otp.lock for next client in queue
+        │
+        ▼
+[3. Game Exit] ───────────► Syncs updated UI/plugin configs back to NAS (if enabled)
 ```
 
 ---
 
-## Troubleshooting & Maintenance
+## Troubleshooting
 
-| Symptom | Cause | Fix |
-| :--- | :--- | :--- |
-| `Vaultwarden TOTP error: Vault is locked.` | `bw_session.txt` expired after a PC reboot or server restart. | Re-run `bw unlock --raw \| Out-File "C:\XIVLauncherBatch\bw_session.txt" -Encoding ASCII -NoNewline` in PowerShell. |
-| Black/blank game window under ISBoxer | FFXIV is set to Exclusive Full Screen (`ScreenMode 0`), which conflicts with Inner Space DX11 window hooks. | Set `ScreenMode 1` (Borderless Windowed) in `FFXIV.cfg`. |
-| `Timed out waiting for XIVLauncher port 4646` | OTP macro support disabled, `Auto-login` enabled, or character shouldn't use 2FA. | Verify `"IsOtpServer": true` and `"AutoLogin": false` in `launcherConfigV3.json`, or remove the character from `vw_items.txt`. |
-| `curl.exe` fails to connect to `localhost:4646` | XIVLauncher binds to IPv4 (`0.0.0.0:4646`), while `localhost` may resolve to IPv6 (`::1`). | Always target explicit IPv4 `http://127.0.0.1:4646/ffxivlauncher/<OTP>` with `curl.exe -4 --http0.9`. |
-| Square Enix temporary login restriction | Too many failed OTP/password attempts in a short window. | Close all `XIVLauncher.exe` instances and wait **15–30 minutes** before retrying. |
+- **`'bw' is not recognized as an internal or external command`**
+  - Close and reopen Command Prompt after installing via `winget`, or verify `bw.exe` is in your system `PATH`.
+- **`No Vaultwarden 2FA mapping found for <character> - skipping OTP...`**
+  - Expected for characters that do not use 2FA.
+  - If the character *does* use 2FA, make sure its item is inside the **`FFIV`** folder in Vaultwarden, has an Authenticator Key saved, and re-run `Update-VaultwardenMap.bat`.
+- **Vaultwarden session expired / `bw get totp` fails:**
+  - Run `Update-VaultwardenMap.bat` again to refresh `bw_session.txt`.
+- **Wrong password error after changing your Square Enix password:**
+  - Untick **Log in automatically** in XIVLauncher for that character once, enter the new password, and let XIVLauncher update Windows Credential Manager.
+- **Port `4646` timeout:**
+  - Confirm **Use One-Time Password** is checked on that character's XIVLauncher window and no other program is using TCP port `4646`.
+
+---
+
+## Credits & Acknowledgments
+
+- **[tsukasa](https://github.com/tsukasa)** — Original creator of [`isboxer_ffxiv_batch`](https://github.com/tsukasa/isboxer_ffxiv_batch) and [`isboxer_ffxiv_guide`](https://github.com/tsukasa/isboxer_ffxiv_guide), which established the ISBoxer + XIVLauncher batch launcher and per-character virtual file (`XIVLauncher-env.cmd`) architecture.
+- **[goatcorp / XIVLauncher](https://github.com/goatcorp/FFXIVQuickLauncher)** — For XIVLauncher and its local HTTP OTP endpoint (`localhost:4646`).
+- **[Vaultwarden](https://github.com/dani-garcia/vaultwarden)** & **[Bitwarden CLI](https://github.com/bitwarden/clients)** — For self-hosted vault and TOTP automation support.
+- **[Lavish Software / ISBoxer](https://isboxer.com/)** — For Inner Space and ISBoxer multi-boxing virtual file support.
