@@ -1,0 +1,1 @@
+(echo bw_session.txt& echo vw_items.txt& echo otp.lock) > .gitignore
