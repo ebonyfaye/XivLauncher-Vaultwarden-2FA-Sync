@@ -1,17 +1,18 @@
 # Automated FFXIV Multi-Client 2FA/TOTP Login (ISBoxer + XIVLauncher + Vaultwarden)
 
-Automated One-Time Password (TOTP) injection for multi-boxing **Final Fantasy XIV** using **Inner Space / ISBoxer**, **XIVLauncher**, and a self-hosted **Vaultwarden** instance via the Bitwarden CLI (`bw`).
+Automated One-Time Password (TOTP) injection for multi-boxing **Final Fantasy XIV** using **Inner Space / ISBoxer**, **XIVLauncher**, and a self-hosted **Vaultwarden** instance via the Bitwarden CLI (`bw`). Supports mixed teams of 2FA and non-2FA accounts seamlessly.
 
 ---
 
 ## Overview & Architecture
 
-When launching multiple FFXIV accounts simultaneously via ISBoxer, XIVLauncher exposes a local HTTP listener on `127.0.0.1:4646` to receive TOTP codes. This wrapper batch script (`XIVLauncher.cmd`) coordinates multi-client launches without port collisions or interactive CLI prompts:
+When launching multiple FFXIV accounts simultaneously via ISBoxer, XIVLauncher exposes a local HTTP listener on `127.0.0.1:4646` to receive TOTP codes. This wrapper batch script (`XIVLauncher.cmd`) coordinates multi-client launches without port collisions, interactive CLI prompts, or delays on non-2FA accounts:
 
-1. **NAS-to-Local Sync:** Mirrors the character's roaming profile from the network share (`X:\XIVLauncherBatch\<character>`) to local storage (`C:\XIVLauncherBatch\<character>`) using multi-threaded `robocopy` (`/MT:8`), then syncs changes back after the game closes.
-2. **Stale Lock Recovery & Queue Serialization:** Uses `C:\XIVLauncherBatch\otp.lock` to serialize launches one character at a time so simultaneous ISBoxer clients never collide on port `4646`. Automatically clears stale lock files if no `XIVLauncher.exe` process is running or if a lock exceeds 65 seconds.
-3. **Listener Detection & Window Guard:** Polls `127.0.0.1:4646` via .NET `TcpClient` (up to 60 seconds) and checks remaining seconds in the current 30-second TOTP window (waiting if fewer than 7 seconds remain so codes never expire mid-submission).
-4. **Non-Interactive Vaultwarden Lookup:** Reads a pre-mapped character-to-UUID file (`vw_items.txt`) and a persisted CLI session key (`bw_session.txt`) to fetch the live 6-digit TOTP with `--nointeraction`, then injects it via `curl.exe -4 --http0.9`.
+1. **Clean Environment & NAS-to-Local Sync:** Clears any inherited character variables, loads `XIVLauncher-env.cmd`, and mirrors the character's roaming profile from the network share (`X:\XIVLauncherBatch\<character>`) to local storage (`C:\XIVLauncherBatch\<character>`) using multi-threaded `robocopy` (`/MT:8`), syncing changes back after the game closes.
+2. **Automatic Non-2FA Pass-Through:** Checks `C:\XIVLauncherBatch\vw_items.txt` for a character-to-UUID mapping. Characters omitted from `vw_items.txt` bypass the OTP queue and port `4646` wait completely, launching directly into the game.
+3. **Stale Lock Recovery & Queue Serialization:** Uses `C:\XIVLauncherBatch\otp.lock` to serialize 2FA launches one character at a time so simultaneous ISBoxer clients never collide on port `4646`. Automatically clears stale lock files if no `XIVLauncher.exe` process is running or if a lock exceeds 65 seconds.
+4. **Listener Detection & Window Guard:** Polls `127.0.0.1:4646` via .NET `TcpClient` (up to 60 seconds) and checks remaining seconds in the current 30-second TOTP window (waiting if fewer than 7 seconds remain so codes never expire mid-submission).
+5. **Non-Interactive Vaultwarden Lookup:** Reads the pre-mapped item UUID (`vw_items.txt`) and a persisted CLI session key (`bw_session.txt`) to fetch the live 6-digit TOTP with `--nointeraction`, then injects it via `curl.exe -4 --http0.9`.
 
 ---
 
@@ -24,6 +25,7 @@ When launching multiple FFXIV accounts simultaneously via ISBoxer, XIVLauncher e
 - **Vaultwarden Folder Structure:**
   - Create a dedicated folder in Vaultwarden (e.g., `Final Fantasy XIV`).
   - Name each login item identically to its corresponding character roaming folder name (e.g., `blossom`), with the TOTP authenticator seed saved on the item.
+  - Omit non-2FA characters from `vw_items.txt` so they launch directly.
 
 ---
 
@@ -37,7 +39,7 @@ X:\XIVLauncherBatch\                  # Network share (source of truth)
 
 C:\XIVLauncherBatch\                  # Local fast-storage working directory
 ├── bw_session.txt                    # Active Bitwarden CLI session token (DO NOT COMMIT)
-├── vw_items.txt                      # Character-to-Vaultwarden Item UUID mapping
+├── vw_items.txt                      # 2FA Character-to-Vaultwarden Item UUID mapping
 ├── otp.lock                          # Temporary runtime mutex lock (auto-cleaned)
 └── <character>\                      # Local synced roaming profile
 ```
@@ -49,11 +51,13 @@ C:\XIVLauncherBatch\                  # Local fast-storage working directory
 ## One-Time Setup
 
 ### 1. Configure XIVLauncher Profiles
-For each character profile:
+For each **2FA-enabled** character profile:
 1. Check **Use one-time password** on the XIVLauncher login screen.
 2. Uncheck **Auto-login** (XIVLauncher must pause on the login screen to keep port `4646` open).
 3. Open **Settings (Gear Icon) → General**, enable **Enable XL Authenticator app/OTP macro support**, and click **Save**.
-4. Ensure `XIVLauncher-env.cmd` passes `XIVLAUNCHER_USE_OTP=true`.
+4. Ensure `FFXIV.cfg` uses **Borderless Windowed** mode (`ScreenMode 1`) so Inner Space / ISBoxer hooks the DirectX 11 window cleanly without rendering a black screen.
+
+*(For **non-2FA** characters, leave **Auto-login** enabled if desired and omit them from `vw_items.txt`.)*
 
 ### 2. Unlock Vaultwarden CLI & Export Item UUIDs
 Run the following in **Administrator PowerShell** to generate your local session key and map your `Final Fantasy XIV` folder items:
@@ -67,17 +71,16 @@ $key = Get-Content "C:\XIVLauncherBatch\bw_session.txt" -Raw
 bw sync --session $key
 bw list folders --session $key
 
-# 3. Map all items in that folder to C:\XIVLauncherBatch\vw_items.txt
+# 3. Map all 2FA items in that folder to C:\XIVLauncherBatch\vw_items.txt
 $folderId = "YOUR_FFXIV_FOLDER_UUID"
 (bw list items --folderid $folderId --session $key | ConvertFrom-Json) |
   ForEach-Object { "$($_.name)=$($_.id)" } |
   Set-Content "C:\XIVLauncherBatch\vw_items.txt" -Encoding ASCII
 ```
 
-Verify `C:\XIVLauncherBatch\vw_items.txt` contains clean `character=uuid` pairs:
+Verify `C:\XIVLauncherBatch\vw_items.txt` contains only your 2FA-enabled characters (`character=uuid`):
 ```text
 blossom=00000000-0000-0000-0000-000000000000
-character2=11111111-1111-1111-1111-111111111111
 ```
 
 ---
@@ -216,7 +219,7 @@ for /f "delims=" %%T in ('bw get totp "%VW_ITEM_ID%" --session "%BW_KEY%" --noin
 echo %LIVE_OTP%| findstr /r "^[0-9][0-9][0-9][0-9][0-9][0-9]$" >nul
 if "%ERRORLEVEL%"=="0" (
   echo Sending fresh OTP %LIVE_OTP% to XIVLauncher...
-  curl.exe -4 -s --http0.9 --max-time 3 "http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP%" >nul 2>&1
+  curl.exe -4 -s --http0.9 --max-time 3 "[http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP](http://127.0.0.1:4646/ffxivlauncher/%LIVE_OTP)%" >nul 2>&1
   echo Sent OTP to XIVLauncher.
   timeout /t 2 /nobreak >nul
 ) else (
@@ -255,6 +258,7 @@ exit 0
 | Symptom | Cause | Fix |
 | :--- | :--- | :--- |
 | `Vaultwarden TOTP error: Vault is locked.` | `bw_session.txt` expired after a PC reboot or server restart. | Re-run `bw unlock --raw \| Out-File "C:\XIVLauncherBatch\bw_session.txt" -Encoding ASCII -NoNewline` in PowerShell. |
-| `Timed out waiting for XIVLauncher port 4646` | OTP macro support disabled, `Auto-login` enabled, or `XIVLAUNCHER_USE_OTP=false`. | Verify `"IsOtpServer": true` and `"AutoLogin": false` in `launcherConfigV3.json`, and ensure `XIVLAUNCHER_USE_OTP=true`. |
+| Black/blank game window under ISBoxer | FFXIV is set to Exclusive Full Screen (`ScreenMode 0`), which conflicts with Inner Space DX11 window hooks. | Set `ScreenMode 1` (Borderless Windowed) in `FFXIV.cfg`. |
+| `Timed out waiting for XIVLauncher port 4646` | OTP macro support disabled, `Auto-login` enabled, or character shouldn't use 2FA. | Verify `"IsOtpServer": true` and `"AutoLogin": false` in `launcherConfigV3.json`, or remove the character from `vw_items.txt`. |
 | `curl.exe` fails to connect to `localhost:4646` | XIVLauncher binds to IPv4 (`0.0.0.0:4646`), while `localhost` may resolve to IPv6 (`::1`). | Always target explicit IPv4 `http://127.0.0.1:4646/ffxivlauncher/<OTP>` with `curl.exe -4 --http0.9`. |
 | Square Enix temporary login restriction | Too many failed OTP/password attempts in a short window. | Close all `XIVLauncher.exe` instances and wait **15–30 minutes** before retrying. |
