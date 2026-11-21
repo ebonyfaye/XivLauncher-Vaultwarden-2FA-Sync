@@ -1,1 +1,3 @@
-(echo bw_session.txt& echo vw_items.txt& echo otp.lock) > .gitignore
+bw_session.txt
+vw_items.txt
+otp.lock
