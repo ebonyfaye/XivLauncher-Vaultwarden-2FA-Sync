@@ -72,6 +72,16 @@ You can install the Bitwarden CLI automatically using **winget** (recommended) o
    ```
    *(Enter your email address, master password, and 2FA code if prompted.)*
 
+### 4. Create the Local Session Directory & Generate `bw_session.txt`
+   Even when running shared launcher configs from a NAS/network drive, each PC requires its own local Bitwarden CLI session token stored in `C:\XIVLauncherBatch\bw_session.txt`. Run the following in PowerShell:
+   ```powershell
+   New-Item -ItemType Directory -Force -Path "C:\XIVLauncherBatch" | Out-Null
+   $session = bw unlock --raw
+   if ($session) {
+       [System.IO.File]::WriteAllText("C:\XIVLauncherBatch\bw_session.txt", $session)
+   }
+
+
 ---
 
 ## Step 2: Configure Your Vaultwarden Folder & 2FA Keys
